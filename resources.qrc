@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="qml/Main.qml">qml/Main.qml</file>
+    <file alias="tracker.html">tracker.html</file>
+  </qresource>
+</RCC>

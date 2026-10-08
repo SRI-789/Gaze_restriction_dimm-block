@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Local gaze tracker</title>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <video id="camera" autoplay playsinline muted></video>
+  <script>
+    window.qtBridgeReady = new Promise((resolve, reject) => {
+      if (!window.qt || !qt.webChannelTransport) {
+        reject(new Error("Qt WebChannel is not available."));
+        return;
+      }
+      new QWebChannel(qt.webChannelTransport, (channel) => {
+        const backend = channel.objects.attentionController;
+        backend.startRequested.connect(() => {
+          window.gazeTrackerStartRequested = true;
+          if (window.startCamera) window.startCamera();
+          setTimeout(() => {
+            if (window.gazeTrackerStartRequested && !window.gazeTrackerStarted) {
+              backend.reportError("MediaPipe tracker did not load. Check internet access and restart the app.");
+            }
+          }, 30000);
+        });
+        backend.stopRequested.connect(() => {
+          window.gazeTrackerStartRequested = false;
+          if (window.stopCamera) window.stopCamera();
+        });
+        resolve(backend);
+      });
+    });
+  </script>
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const MODEL_URL =
+      "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+    const video = document.querySelector("#camera");
+    let backend;
+    let landmarker;
+    let stream;
+    let animationId;
+    let lastVideoTime = -1;
+
+    function extractFeatures(landmarks) {
+      const point = (index) => landmarks[index];
+      const normalized = (center, firstIndex, secondIndex, axis) => {
+        const first = point(firstIndex)[axis];
+        const second = point(secondIndex)[axis];
+        const span = second - first;
+        if (Math.abs(span) < 0.001) return null;
+        return (point(center)[axis] - first) / span;
+      };
+
+      const leftX = normalized(468, 33, 133, "x");
+      const rightX = normalized(473, 362, 263, "x");
+      const leftY = normalized(468, 159, 145, "y");
+      const rightY = normalized(473, 386, 374, "y");
+      if ([leftX, rightX, leftY, rightY].some((value) => value === null)) return null;
+
+      const eyeLeft = point(33);
+      const eyeRight = point(263);
+      const eyeSpan = Math.abs(eyeRight.x - eyeLeft.x);
+      if (eyeSpan < 0.001) return null;
+      const eyeLineY = (point(159).y + point(386).y) / 2;
+      const nose = point(1);
+      return {
+        irisX: (leftX + rightX) / 2,
+        irisY: (leftY + rightY) / 2,
+        headX: (nose.x - (eyeLeft.x + eyeRight.x) / 2) / eyeSpan,
+        headY: (nose.y - eyeLineY) / eyeSpan
+      };
+    }
+
+    async function startCamera() {
+      try {
+        backend = await window.qtBridgeReady;
+        if (!landmarker) {
+          const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+          );
+          landmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+            runningMode: "VIDEO",
+            numFaces: 1
+          });
+        }
+        if (!stream) {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user" },
+            audio: false
+          });
+          video.srcObject = stream;
+        }
+        await video.play();
+        window.gazeTrackerStarted = true;
+        if (animationId) cancelAnimationFrame(animationId);
+        animationId = requestAnimationFrame(processFrame);
+      } catch (error) {
+        console.error("Could not start gaze tracking:", error);
+        backend?.reportError(`Could not start camera or face tracker: ${error.message}`);
+      }
+    }
+
+    function processFrame() {
+      if (stream && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+          video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const result = landmarker.detectForVideo(video, performance.now());
+        const landmarks = result.faceLandmarks?.[0];
+        const features = landmarks ? extractFeatures(landmarks) : null;
+        if (backend) {
+          if (features) {
+            backend.submitGaze(
+              features.irisX, features.irisY,
+              features.headX, features.headY, true
+            );
+          } else {
+            backend.submitGaze(0, 0, 0, 0, false);
+          }
+        }
+      }
+      animationId = requestAnimationFrame(processFrame);
+    }
+
+    function stopCamera() {
+      if (animationId) cancelAnimationFrame(animationId);
+      animationId = null;
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+      video.srcObject = null;
+      lastVideoTime = -1;
+    }
+
+    window.qtBridgeReady.then((bridge) => {
+      backend = bridge;
+      backend.sessionLockChanged.connect((locked) => {
+        if (locked) pauseCamera();
+        else resumeCamera();
+      });
+      window.startCamera = startCamera;
+      window.stopCamera = stopCamera;
+      backend.trackerReady();
+    }).catch((error) => console.error(error));
+
+    function pauseCamera() {
+      if (animationId) cancelAnimationFrame(animationId);
+      animationId = null;
+      if (stream) stream.getVideoTracks().forEach((track) => { track.enabled = false; });
+      video.pause();
+      lastVideoTime = -1;
+    }
+
+    async function resumeCamera() {
+      if (!stream) return;
+      stream.getVideoTracks().forEach((track) => { track.enabled = true; });
+      try {
+        await video.play();
+        lastVideoTime = -1;
+        animationId = requestAnimationFrame(processFrame);
+      } catch (error) {
+        backend?.reportError(`Could not resume camera after unlock: ${error.message}`);
+      }
+    }
+  </script>
+</body>
+</html>
